@@ -1,5 +1,7 @@
 # little-proxy
 
+[![CI](https://github.com/DiamondDen/little-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/DiamondDen/little-proxy/actions/workflows/ci.yml)
+
 Крошечная программа для Windows: заворачивает TCP-трафик выбранных процессов в SOCKS5 или HTTP
 прокси. Процессы выбираются регулярными выражениями по полному пути exe, без учёта регистра —
 `\claude[^\]*\.exe$` поймает и `C:\…\claude.exe`, и `D:\old\claude32521353-old.exe`.
