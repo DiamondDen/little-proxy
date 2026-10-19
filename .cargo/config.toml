@@ -1,0 +1,3 @@
+[target.x86_64-pc-windows-msvc]
+# CRT вшивается в exe: на чистой Windows нет VCRUNTIME140.dll.
+rustflags = ["-C", "target-feature=+crt-static"]
