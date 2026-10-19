@@ -37,22 +37,18 @@ impl Matcher {
                 RegexBuilder::new(r).case_insensitive(true).build().map_err(|e| format!("правило «{r}»: {e}"))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if rules.is_empty() {
-            return Err("не задано ни одного правила для процессов".into());
-        }
         Ok(Matcher { rules, own_pid: std::process::id() })
     }
 
     /// Имя exe, если процесс подходит под правила. Сами себя не заворачиваем никогда — иначе петля.
     pub fn check(&self, pid: u32) -> Option<Arc<str>> {
         let path = self.matched_path(pid).ok()??;
-        let name = Path::new(&path).file_name().map_or(path.as_str(), |n| n.to_str().unwrap_or(&path));
-        Some(name.into())
+        Some(file_name(&path).into())
     }
 
     /// `Ok(Some(путь))` — подходит, `Ok(None)` — не подходит или исключён, `Err` — путь не прочитан.
     fn matched_path(&self, pid: u32) -> Result<Option<String>, ()> {
-        if pid <= SYSTEM_PIDS || pid == self.own_pid {
+        if self.rules.is_empty() || pid <= SYSTEM_PIDS || pid == self.own_pid {
             return Ok(None);
         }
         let path = image_path(pid).ok_or(())?;
@@ -85,8 +81,17 @@ pub struct Process {
 
 impl Process {
     pub fn name(&self) -> &str {
-        Path::new(&self.path).file_name().and_then(|n| n.to_str()).unwrap_or(&self.path)
+        file_name(&self.path)
     }
+}
+
+/// Имя exe процесса; `None`, если процесс уже завершился или недоступен.
+pub fn exe_name(pid: u32) -> Option<Arc<str>> {
+    image_path(pid).map(|path| file_name(&path).into())
+}
+
+fn file_name(path: &str) -> &str {
+    Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or(path)
 }
 
 /// Командная строка процесса (Windows 8.1+). `None`, если процесс завершился или недоступен.

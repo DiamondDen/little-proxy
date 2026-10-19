@@ -2,7 +2,10 @@
 
 use std::{
     cell::{Cell, RefCell},
+    io,
     ptr::null,
+    sync::mpsc::{self, Receiver, TryRecvError},
+    thread,
 };
 
 use windows_sys::Win32::{
@@ -10,10 +13,11 @@ use windows_sys::Win32::{
     Graphics::Gdi::{CreateFontIndirectW, GetSysColorBrush, COLOR_BTNFACE, HFONT},
     System::LibraryLoader::GetModuleHandleW,
     UI::{
+        Controls::{InitCommonControlsEx, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, NMHDR, NM_CLICK, NM_RETURN},
         HiDpi::*,
         Input::KeyboardAndMouse::EnableWindow,
         Shell::{
-            Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+            ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
             NOTIFYICONDATAW,
         },
         WindowsAndMessaging::*,
@@ -22,13 +26,16 @@ use windows_sys::Win32::{
 
 use little_proxy::{
     config::Config,
-    engine::Engine,
+    engine::{Engine, Setup},
     log::Log,
     procs::Matcher,
+    proxy,
 };
 
 const ID_START: i32 = 100;
 const ID_CHECK: i32 = 101;
+const ID_GITHUB: i32 = 102;
+const GITHUB_URL: &str = "https://github.com/DiamondDen/little-proxy";
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 300;
 const LOG_LINES: usize = 500;
@@ -50,11 +57,21 @@ struct App {
     tray_hinted: bool,
     proxy: HWND,
     rules: HWND,
+    domains: HWND,
     start: HWND,
     status: HWND,
     log_box: HWND,
     log: Log,
     engine: Option<Engine>,
+    /// Идёт проверка прокси; по её успеху перехват запустится с этими настройками.
+    pending: Option<Pending>,
+}
+
+struct Pending {
+    cfg: Config,
+    setup: Setup,
+    /// Внешний IP через прокси или причина, по которой прокси не ответил.
+    result: Receiver<io::Result<String>>,
 }
 
 thread_local! {
@@ -80,6 +97,11 @@ fn get_text(h: HWND) -> String {
 fn set_text(h: HWND, s: &str) {
     // SAFETY: строка с завершающим нулём живёт до конца вызова.
     unsafe { SetWindowTextW(h, wide(s).as_ptr()) };
+}
+
+/// Непустые строки многострочного поля без пробелов по краям.
+fn lines(h: HWND) -> Vec<String> {
+    get_text(h).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
 }
 
 fn send(h: HWND, msg: u32, w: usize, l: isize) -> isize {
@@ -173,14 +195,25 @@ impl App {
         }
     }
 
+    fn open_github(&self) {
+        // SAFETY: строки с завершающим нулём живут до конца вызова.
+        let rc = unsafe {
+            ShellExecuteW(self.hwnd, wide("open").as_ptr(), wide(GITHUB_URL).as_ptr(), null(), null(), SW_SHOWNORMAL)
+        };
+        // Значение не больше 32 — код ошибки ShellExecute.
+        if rc as usize <= 32 {
+            self.log.push(format!("Не удалось открыть {GITHUB_URL}: код {}", rc as usize));
+        }
+    }
+
     fn read_config(&self) -> Config {
-        let rules = get_text(self.rules).lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect();
-        Config { proxy: get_text(self.proxy).trim().into(), rules }
+        Config { proxy: get_text(self.proxy).trim().into(), rules: lines(self.rules), domains: lines(self.domains) }
     }
 
     fn show_config(&self, cfg: &Config) {
         set_text(self.proxy, &cfg.proxy);
         set_text(self.rules, &cfg.rules.join("\r\n"));
+        set_text(self.domains, &cfg.domains.join("\r\n"));
     }
 
     /// Сверяет запущенные процессы с правилами из поля и выводит совпадения в журнал.
@@ -213,25 +246,71 @@ impl App {
     fn toggle(&mut self) {
         if let Some(engine) = self.engine.take() {
             engine.stop();
-        } else {
-            let cfg = self.read_config();
-            match Engine::start(&cfg, self.log.clone()) {
-                Ok(engine) => {
-                    if let Err(e) = cfg.save() {
-                        self.log.push(format!("Настройки не сохранены: {e}"));
+        } else if self.pending.is_none() {
+            self.check_proxy();
+        }
+        self.update_controls();
+        self.tick();
+    }
+
+    /// Запуск начинается с проверки прокси в фоне: трафик заворачиваем, только если прокси
+    /// отвечает. Результат забирает `tick`.
+    fn check_proxy(&mut self) {
+        let cfg = self.read_config();
+        let setup = match Setup::new(&cfg) {
+            Ok(setup) => setup,
+            Err(e) => return self.log.push(format!("Не запущено: {e}")),
+        };
+        let (tx, rx) = mpsc::channel();
+        let up = setup.upstream().clone();
+        // Окно могли закрыть до конца проверки — тогда результат никому не нужен.
+        let spawned = thread::Builder::new().name("proxy-check".into()).spawn(move || drop(tx.send(proxy::external_ip(&up))));
+        match spawned {
+            Ok(_) => {
+                self.log.push("Проверка прокси…");
+                self.pending = Some(Pending { cfg, setup, result: rx });
+            }
+            Err(e) => self.log.push(format!("Не запущено: поток проверки прокси: {e}")),
+        }
+    }
+
+    /// Результат проверки прокси, если он уже готов.
+    fn poll_proxy_check(&mut self) {
+        let Some(p) = &self.pending else { return };
+        let result = match p.result.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err(io::Error::other("поток проверки завершился без ответа")),
+        };
+        let Some(Pending { cfg, setup, .. }) = self.pending.take() else { return };
+        match result {
+            Err(e) => self.log.push(format!("Прокси не отвечает, перехват не запущен: {e}")),
+            Ok(ip) => {
+                self.log.push(format!("Прокси работает, внешний IP: {ip}"));
+                match Engine::start(setup, self.log.clone()) {
+                    Ok(engine) => {
+                        if let Err(e) = cfg.save() {
+                            self.log.push(format!("Настройки не сохранены: {e}"));
+                        }
+                        self.engine = Some(engine);
                     }
-                    self.engine = Some(engine);
+                    Err(e) => self.log.push(format!("Не запущено: {e}")),
                 }
-                Err(e) => self.log.push(format!("Не запущено: {e}")),
             }
         }
-        let running = self.engine.is_some();
-        for h in [self.proxy, self.rules] {
-            // SAFETY: хэндлы контролов живут вместе с окном.
-            unsafe { EnableWindow(h, (!running) as i32) };
+        self.update_controls();
+    }
+
+    fn update_controls(&self) {
+        let (running, checking) = (self.engine.is_some(), self.pending.is_some());
+        // SAFETY: хэндлы контролов живут вместе с окном.
+        unsafe {
+            for h in [self.proxy, self.rules, self.domains] {
+                EnableWindow(h, (!running && !checking) as i32);
+            }
+            EnableWindow(self.start, (!checking) as i32);
         }
         set_text(self.start, if running { "Остановить" } else { "Запустить" });
-        self.tick();
     }
 
     /// Видна ли последняя строка журнала.
@@ -247,6 +326,7 @@ impl App {
     }
 
     fn tick(&mut self) {
+        self.poll_proxy_check();
         let lines = self.log.drain();
         if !lines.is_empty() {
             // Докручиваем вниз, только если пользователь и так внизу — иначе не мешаем читать.
@@ -264,6 +344,7 @@ impl App {
         }
         let status = match &self.engine {
             Some(e) => format!("Работает · сессий: {}", e.shared().session_count()),
+            None if self.pending.is_some() => "Проверка прокси…".into(),
             None => "Остановлено".into(),
         };
         if get_text(self.status) != status {
@@ -285,6 +366,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 ID_CHECK => app.check(),
                 _ => return false,
             },
+            WM_NOTIFY => {
+                let hdr = &*(l as *const NMHDR);
+                if hdr.idFrom != ID_GITHUB as usize || !matches!(hdr.code, NM_CLICK | NM_RETURN) {
+                    return false;
+                }
+                app.open_github();
+            }
             WM_TIMER => app.tick(),
             // Свёрнутое окно прячем в трей. Крестик при работающем перехвате тоже прячет (выход —
             // из меню значка), а при остановленном — закрывает программу.
@@ -347,7 +435,10 @@ fn main() {
         RegisterClassW(&wc);
 
         let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-        let mut rect = RECT { left: 0, top: 0, right: s(480), bottom: s(440) };
+        // Без этого SysLink (ссылка на GitHub) не создастся.
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LINK_CLASS };
+        InitCommonControlsEx(&icc);
+        let mut rect = RECT { left: 0, top: 0, right: s(480), bottom: s(540) };
         AdjustWindowRectEx(&mut rect, style, 0, WS_EX_CONTROLPARENT);
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
@@ -396,16 +487,21 @@ fn main() {
         let proxy = edit(0, 76, 12, 392, 23);
         label("socks5://логин:пароль@хост:порт или http://…; логин и пароль необязательны", 76, 38, 392);
         label("Процессы — регулярные выражения по полному пути exe, по одному в строке:", 12, 68, 456);
-        let rules = edit(ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL as i32, 12, 92, 456, 84);
-        let start = ctl("BUTTON", "Запустить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 12, 186, 120, 28, ID_START);
-        ctl("BUTTON", "Проверить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 140, 186, 110, 28, ID_CHECK);
-        let status = label("", 260, 190, 208);
+        let multiline = ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL as i32;
+        let rules = edit(multiline, 12, 92, 456, 64);
+        label("Список доменов, DoH/DoT - будет заблокирован", 12, 166, 456);
+        let domains = edit(multiline, 12, 190, 456, 64);
+        let start = ctl("BUTTON", "Запустить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 12, 264, 120, 28, ID_START);
+        ctl("BUTTON", "Проверить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 140, 264, 110, 28, ID_CHECK);
+        let status = label("", 260, 268, 208);
         let log_box =
-            ctl("LISTBOX", "", LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL as i32 | WS_HSCROLL as i32, WS_EX_CLIENTEDGE, 12, 224, 456, 204, 0);
+            ctl("LISTBOX", "", LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL as i32 | WS_HSCROLL as i32, WS_EX_CLIENTEDGE, 12, 302, 456, 204, 0);
         SendMessageW(log_box, LB_SETHORIZONTALEXTENT, s(1200) as usize, 0);
+        let link = format!("<a>{}</a>", GITHUB_URL.trim_start_matches("https://"));
+        ctl("SysLink", &link, WS_TABSTOP as i32, 0, 12, 514, 456, 20, ID_GITHUB);
 
         let tray_ok = tray(hwnd, icon, NIM_ADD, "little-proxy — Остановлено");
-        let app = App { hwnd, icon, tray_ok, tray_hinted: false, proxy, rules, start, status, log_box, log: Log::default(), engine: None };
+        let app = App { hwnd, icon, tray_ok, tray_hinted: false, proxy, rules, domains, start, status, log_box, log: Log::default(), engine: None, pending: None };
         match Config::load() {
             Ok(cfg) => app.show_config(&cfg.unwrap_or_default()),
             Err(e) => {

@@ -6,10 +6,16 @@
 //! Так приёмник видит адресата B в адресе пира, а исходный порт b хранится в таблице NAT.
 //! UDP целевых процессов и их соединения, открытые до запуска, отбрасываются — мимо прокси
 //! не уходит ничего.
+//!
+//! Доменные правила: входящие ответы DNS перехватываются (и возвращаются без изменений), адреса
+//! доменов из списка запоминаются, и новые соединения любого процесса к ним на порты HTTP/HTTPS
+//! отражаются так же. QUIC к этим адресам, DoT и DoH блокируются — иначе браузер обошёл бы и
+//! прокси, и наш разбор DNS.
 
 use std::{
     collections::{HashMap, HashSet},
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, TcpStream},
+    io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpStream},
     os::windows::process::CommandExt,
     process::Command,
     sync::{
@@ -23,6 +29,7 @@ use std::{
 use crate::{
     config::Config,
     divert::{self, Address, Handle},
+    dns::{self, Domains},
     log::Log,
     procs::{self, Matcher, TCP, UDP},
     proxy::{self, Upstream},
@@ -37,6 +44,17 @@ const FIREWALL_RULE: &str = "little-proxy";
 const ERROR_NO_DATA: i32 = 232;
 const TCP_SYN: u8 = 0x02;
 const TCP_ACK: u8 = 0x10;
+/// Порты HTTP и HTTPS: соединения к доменам из списка заворачиваются только на них.
+const WEB_PORTS: [u16; 2] = [80, HTTPS_PORT];
+const HTTPS_PORT: u16 = 443;
+/// DNS over TLS и DNS over QUIC.
+const DOT_PORT: u16 = 853;
+/// Адрес из ответа DNS помним не меньше этого: приложения кешируют дольше коротких TTL.
+const DNS_TTL_MIN: Duration = Duration::from_secs(5 * 60);
+/// И не дольше суток — столько по умолчанию держит записи кеш DNS Windows.
+const DNS_TTL_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+const DNS_FILTER: &str = "inbound and !loopback and udp.SrcPort == 53";
+const UNKNOWN_PROCESS: &str = "неизвестный процесс";
 
 #[derive(Clone)]
 struct Owner {
@@ -81,12 +99,37 @@ pub struct Shared {
     nat: Mutex<HashMap<(IpAddr, u16), Nat>>,
     next_id: AtomicU64,
     sessions: Mutex<HashMap<u64, TcpStream>>,
+    own_pid: u32,
+    /// Пусто — доменные правила выключены вместе с блокировкой DoH/DoT.
+    domains: Domains,
+    doh_hosts: Domains,
+    /// Адреса из ответов DNS для доменов из правил и серверов DoH.
+    learned: RwLock<HashMap<IpAddr, Learned>>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Via {
+    Domain,
+    Doh,
+}
+
+struct Learned {
+    via: Via,
+    until: Instant,
 }
 
 enum Verdict {
     Pass,
     Drop,
     Reflect,
+}
+
+/// Что уже сообщено в журнал — чтобы не повторять на каждый пакет.
+#[derive(Default)]
+struct Noted {
+    udp: HashSet<Arc<str>>,
+    secure_dns: HashSet<(IpAddr, u16)>,
+    quic: bool,
 }
 
 impl Shared {
@@ -166,21 +209,93 @@ impl Shared {
         target
     }
 
-    fn route(&self, p: &mut [u8], udp_noted: &mut HashSet<Arc<str>>) -> Verdict {
+    fn route(&self, p: &mut [u8], noted: &mut Noted) -> Verdict {
         let Some(ip) = Ip::parse(p) else { return Verdict::Pass };
-        match ip.proto {
-            TCP => self.route_tcp(p, &ip),
-            UDP => match self.target(UDP, ip.port(p, 0), false) {
-                Some(name) => {
-                    if udp_noted.insert(name.clone()) {
-                        self.log.push(format!("{name}: UDP заблокирован (прокси передаёт только TCP)"));
-                    }
-                    Verdict::Drop
-                }
-                None => Verdict::Pass,
-            },
-            _ => Verdict::Pass,
+        if ip.proto != TCP && ip.proto != UDP {
+            return Verdict::Pass;
         }
+        let (dst, dst_port) = (ip.dst(p), ip.port(p, 2));
+        if self.is_secure_dns(dst, dst_port) {
+            if noted.secure_dns.insert((dst, dst_port)) {
+                let to = SocketAddr::new(dst, dst_port);
+                self.log.push(format!("DoH/DoT к {to} заблокирован — система и браузеры перейдут на обычный DNS"));
+            }
+            return Verdict::Drop;
+        }
+        if ip.proto == TCP {
+            return self.route_tcp(p, &ip);
+        }
+        if let Some(name) = self.target(UDP, ip.port(p, 0), false) {
+            if noted.udp.insert(name.clone()) {
+                self.log.push(format!("{name}: UDP заблокирован (прокси передаёт только TCP)"));
+            }
+            return Verdict::Drop;
+        }
+        if dst_port == HTTPS_PORT && self.learned(dst) == Some(Via::Domain) {
+            if !noted.quic {
+                noted.quic = true;
+                self.log.push("QUIC (UDP 443) к доменам из списка заблокирован — браузеры перейдут на TCP");
+            }
+            return Verdict::Drop;
+        }
+        Verdict::Pass
+    }
+
+    /// DoT/DoQ на любой адрес и HTTPS к серверам DoH: зашифрованный DNS прошёл бы мимо разбора
+    /// ответов, и адреса доменов из правил остались бы неизвестны.
+    fn is_secure_dns(&self, dst: IpAddr, port: u16) -> bool {
+        !self.domains.is_empty()
+            && (port == DOT_PORT
+                || (port == HTTPS_PORT && (dns::DOH_IPS.contains(&dst) || self.learned(dst) == Some(Via::Doh))))
+    }
+
+    fn learned(&self, ip: IpAddr) -> Option<Via> {
+        let learned = self.learned.read().unwrap();
+        learned.get(&ip).filter(|l| l.until > Instant::now()).map(|l| l.via)
+    }
+
+    /// Запоминает адреса из ответа DNS, если вопрос был о домене из правил или о сервере DoH.
+    fn learn(&self, p: &[u8]) {
+        let Some(ip) = Ip::parse(p).filter(|ip| ip.proto == UDP) else { return };
+        let Some(answer) = dns::parse_response(&p[ip.l4 + 8..]) else { return };
+        let via = if self.domains.matches(&answer.name) {
+            Via::Domain
+        } else if self.doh_hosts.matches(&answer.name) {
+            Via::Doh
+        } else {
+            return;
+        };
+        let now = Instant::now();
+        let mut fresh = Vec::new();
+        {
+            let mut learned = self.learned.write().unwrap();
+            for (addr, ttl) in answer.addrs {
+                let until = now + Duration::from_secs(ttl.into()).clamp(DNS_TTL_MIN, DNS_TTL_MAX);
+                if learned.insert(addr, Learned { via, until }).is_none_or(|old| old.via != via || old.until <= now) {
+                    fresh.push(addr.to_string());
+                }
+            }
+        }
+        // Только новые адреса: продление TTL каждым повторным ответом журнал не засоряет.
+        if !fresh.is_empty() {
+            let what = if via == Via::Doh { " (сервер DoH — HTTPS к нему заблокирован)" } else { "" };
+            self.log.push(format!("DNS {}{what}: {}", answer.name, fresh.join(", ")));
+        }
+    }
+
+    /// Имя exe для нового соединения на HTTP/HTTPS к адресу домена из правил; сами себя
+    /// (подключения к вышестоящему прокси) и ответы серверов не заворачиваем.
+    fn by_domain(&self, dst: IpAddr, dst_port: u16, src_port: u16) -> Option<Arc<str>> {
+        if !WEB_PORTS.contains(&dst_port) || self.learned(dst) != Some(Via::Domain) {
+            return None;
+        }
+        // Для нового соединения target() уже сверил владельца порта с таблицей IP Helper.
+        let pid = match self.owners.read().unwrap().get(&(TCP, src_port)) {
+            Some(o) if o.listening || o.pid == self.own_pid => return None,
+            Some(o) => Some(o.pid),
+            None => None,
+        };
+        Some(pid.and_then(procs::exe_name).unwrap_or_else(|| UNKNOWN_PROCESS.into()))
     }
 
     fn route_tcp(&self, p: &mut [u8], ip: &Ip) -> Verdict {
@@ -198,7 +313,8 @@ impl Shared {
         if !syn && self.nat.lock().unwrap().contains_key(&key) {
             return self.to_proxy(p, ip);
         }
-        let Some(name) = self.target(TCP, src_port, syn) else {
+        let target = self.target(TCP, src_port, syn);
+        let Some(name) = target.or_else(|| syn.then(|| self.by_domain(dst, dst_port, src_port)).flatten()) else {
             if syn {
                 self.nat.lock().unwrap().remove(&key);
             }
@@ -229,6 +345,8 @@ impl Shared {
             Some(at) => at.elapsed() < NAT_LINGER,
             None => n.accepted || n.created.elapsed() < NAT_LINGER,
         });
+        let now = Instant::now();
+        self.learned.write().unwrap().retain(|_, l| l.until > now);
     }
 }
 
@@ -286,6 +404,29 @@ impl Ip {
     }
 }
 
+/// Разобранные настройки: ошибки в них видны сразу, до проверки прокси и запуска перехвата.
+pub struct Setup {
+    upstream: Upstream,
+    matcher: Matcher,
+    domains: Domains,
+}
+
+impl Setup {
+    pub fn new(cfg: &Config) -> Result<Setup, String> {
+        let upstream = Upstream::parse(&cfg.proxy)?;
+        let matcher = Matcher::new(&cfg.rules)?;
+        let domains = Domains::new(&cfg.domains)?;
+        if cfg.rules.is_empty() && domains.is_empty() {
+            return Err("не задано ни одного правила — ни для процессов, ни для доменов".into());
+        }
+        Ok(Setup { upstream, matcher, domains })
+    }
+
+    pub fn upstream(&self) -> &Upstream {
+        &self.upstream
+    }
+}
+
 pub struct Engine {
     shared: Arc<Shared>,
     handles: Vec<Arc<Handle>>,
@@ -293,9 +434,9 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn start(cfg: &Config, log: Log) -> Result<Engine, String> {
-        let upstream = Upstream::parse(&cfg.proxy)?;
-        let matcher = Matcher::new(&cfg.rules)?;
+    pub fn start(setup: Setup, log: Log) -> Result<Engine, String> {
+        let Setup { upstream, matcher, domains } = setup;
+        let doh_hosts = Domains::new(dns::DOH_HOSTS)?;
         divert::load().map_err(|e| format!("WinDivert: {e}"))?;
         // Правило — до открытия порта: иначе Windows успевает показать окно «Разрешить доступ»,
         // а отмена в нём создаёт блокирующие правила, которые сильнее нашего разрешающего.
@@ -313,6 +454,10 @@ impl Engine {
             nat: Mutex::default(),
             next_id: AtomicU64::new(1),
             sessions: Mutex::default(),
+            own_pid: std::process::id(),
+            domains,
+            doh_hosts,
+            learned: RwLock::default(),
         });
         let mut engine = Engine { shared: shared.clone(), handles: Vec::new(), threads: Vec::new() };
         match engine.spawn_all(v4, v6) {
@@ -360,6 +505,16 @@ impl Engine {
             Ok(0) => {}
             Ok(n) => sh.log.push(format!("Сброшено старых соединений: {n} — они переподключатся через прокси")),
             Err(e) => sh.log.push(format!("Не удалось сбросить старые соединения: {e}")),
+        }
+
+        if !sh.domains.is_empty() {
+            let dns = Arc::new(Handle::open(DNS_FILTER, divert::LAYER_NETWORK, 0).map_err(open_error)?);
+            self.handles.push(dns.clone());
+            self.spawn("dns", {
+                let sh = sh.clone();
+                move || dns_answers(sh, dns)
+            })?;
+            flush_dns(&sh.log);
         }
 
         let net = Arc::new(Handle::open("outbound and !loopback and (tcp or udp)", divert::LAYER_NETWORK, 0).map_err(open_error)?);
@@ -415,40 +570,52 @@ fn open_error(e: std::io::Error) -> String {
     format!("WinDivert: {e}{hint}")
 }
 
+/// Следующий пакет или событие; `None` — хэндл закрыт. Ошибка, вызванная не остановкой,
+/// уходит в журнал после `stopped`.
+fn next(sh: &Shared, h: &Handle, buf: &mut [u8], addr: &mut Address, stopped: &str) -> Option<usize> {
+    match h.recv(buf, addr) {
+        Ok(len) => Some(len),
+        Err(e) => {
+            if sh.is_running() && e.raw_os_error() != Some(ERROR_NO_DATA) {
+                sh.log.push(format!("{stopped}: {e}"));
+            }
+            None
+        }
+    }
+}
+
+/// Ошибки отправки пакетов — в журнал не чаще раза в `SEND_ERROR_LOG_EVERY`.
+#[derive(Default)]
+struct SendErrors(Option<Instant>);
+
+impl SendErrors {
+    fn check(&mut self, log: &Log, what: &str, sent: io::Result<()>) {
+        if let Err(e) = sent {
+            if self.0.is_none_or(|t| t.elapsed() > SEND_ERROR_LOG_EVERY) {
+                log.push(format!("{what}: {e}"));
+                self.0 = Some(Instant::now());
+            }
+        }
+    }
+}
+
 fn socket_events(sh: Arc<Shared>, h: Arc<Handle>) {
     let mut addr = Address::default();
     let mut none = [0u8; 64]; // у событий сокетного слоя нет данных пакета
-    loop {
-        match h.recv(&mut none, &mut addr) {
-            Ok(_) => sh.on_socket_event(addr.event(), &addr.socket()),
-            Err(e) => {
-                if sh.is_running() && e.raw_os_error() != Some(ERROR_NO_DATA) {
-                    sh.log.push(format!("Слежение за сокетами остановлено: {e}"));
-                }
-                return;
-            }
-        }
+    while next(&sh, &h, &mut none, &mut addr, "Слежение за сокетами остановлено").is_some() {
+        sh.on_socket_event(addr.event(), &addr.socket());
     }
 }
 
 fn packets(sh: Arc<Shared>, h: Arc<Handle>) {
     let mut buf = vec![0u8; divert::MTU_MAX];
     let mut addr = Address::default();
-    let mut udp_noted = HashSet::new();
+    let mut noted = Noted::default();
     let mut last_sweep = Instant::now();
-    let mut last_send_error: Option<Instant> = None;
-    loop {
-        let len = match h.recv(&mut buf, &mut addr) {
-            Ok(len) => len,
-            Err(e) => {
-                if sh.is_running() && e.raw_os_error() != Some(ERROR_NO_DATA) {
-                    sh.log.push(format!("Перехват остановлен: {e}"));
-                }
-                break;
-            }
-        };
+    let mut send_errors = SendErrors::default();
+    while let Some(len) = next(&sh, &h, &mut buf, &mut addr, "Перехват остановлен") {
         let p = &mut buf[..len];
-        let sent = match sh.route(p, &mut udp_noted) {
+        let sent = match sh.route(p, &mut noted) {
             Verdict::Pass => h.send(p, &addr),
             Verdict::Drop => Ok(()),
             Verdict::Reflect => {
@@ -457,12 +624,7 @@ fn packets(sh: Arc<Shared>, h: Arc<Handle>) {
                 h.send(p, &addr)
             }
         };
-        if let Err(e) = sent {
-            if last_send_error.is_none_or(|t| t.elapsed() > SEND_ERROR_LOG_EVERY) {
-                sh.log.push(format!("Не удалось отправить пакет: {e}"));
-                last_send_error = Some(Instant::now());
-            }
-        }
+        send_errors.check(&sh.log, "Не удалось отправить пакет", sent);
         if last_sweep.elapsed() > SWEEP_EVERY {
             sh.sweep();
             last_sweep = Instant::now();
@@ -470,6 +632,31 @@ fn packets(sh: Arc<Shared>, h: Arc<Handle>) {
     }
     // Без этого необработанные пакеты копились бы в очереди и сеть системы встала бы.
     h.shutdown();
+}
+
+/// Ответы DNS: запоминаем адреса и возвращаем пакет в систему без изменений. Перехват, а не
+/// копия (sniff): так адрес известен раньше, чем приложение получит ответ и начнёт соединение.
+fn dns_answers(sh: Arc<Shared>, h: Arc<Handle>) {
+    let mut buf = vec![0u8; divert::MTU_MAX];
+    let mut addr = Address::default();
+    let mut send_errors = SendErrors::default();
+    while let Some(len) = next(&sh, &h, &mut buf, &mut addr, "Разбор DNS остановлен") {
+        sh.learn(&buf[..len]);
+        send_errors.check(&sh.log, "Не удалось вернуть ответ DNS", h.send(&buf[..len], &addr));
+    }
+    h.shutdown();
+}
+
+/// Ответ из кеша DNS Windows не проходит по сети: без очистки адреса доменов, которые уже
+/// спрашивали, остались бы неизвестны до конца их TTL.
+fn flush_dns(log: &Log) {
+    match Command::new("ipconfig").arg("/flushdns").creation_flags(CREATE_NO_WINDOW).output() {
+        Ok(out) if out.status.success() => {
+            log.push("Кеш DNS очищен. Соединения к доменам, открытые до запуска, идут напрямую — перезапустите браузер")
+        }
+        Ok(out) => log.push(format!("Кеш DNS не очищен ({}) — часть доменов пойдёт напрямую до конца TTL", out.status)),
+        Err(e) => log.push(format!("Кеш DNS не очищен: ipconfig не запустился: {e}")),
+    }
 }
 
 /// Отражённые пакеты для системы — входящие подключения к приёмнику; без разрешающего правила

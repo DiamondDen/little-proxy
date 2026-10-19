@@ -2,6 +2,7 @@
 
 pub mod config;
 mod divert;
+pub mod dns;
 pub mod engine;
 pub mod log;
 pub mod procs;

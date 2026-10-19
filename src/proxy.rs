@@ -84,6 +84,10 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const SNI_WAIT: Duration = Duration::from_millis(800);
 const TLS_PORT: u16 = 443;
 const THREAD_STACK: usize = 128 * 1024;
+/// Страница Cloudflare со строками `ключ=значение`, среди них `ip=` — адрес, с которого пришли.
+const TRACE_HOST: &str = "1.1.1.1";
+const TRACE_PATH: &str = "/cdn-cgi/trace";
+const TRACE_MAX: u64 = 16 * 1024;
 
 /// Слушатели на одном порту для IPv4 и IPv6 (порт выбирает система).
 pub fn listen() -> io::Result<(TcpListener, TcpListener)> {
@@ -366,6 +370,36 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// `ip (страна)` из https://1.1.1.1/cdn-cgi/trace, запрошенной через прокси: внешний адрес
+/// трафика и заодно проверка, что прокси живой.
+pub fn external_ip(up: &Upstream) -> io::Result<String> {
+    let s = connect(up, TRACE_HOST, TLS_PORT)?;
+    s.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    s.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+    let tls = native_tls::TlsConnector::new().map_err(|e| io::Error::other(format!("TLS: {e}")))?;
+    let mut tls = tls.connect(TRACE_HOST, s).map_err(|e| io::Error::other(format!("TLS с {TRACE_HOST}: {e}")))?;
+    // HTTP/1.0: ответ без chunked, конец тела — закрытие соединения.
+    tls.write_all(format!("GET {TRACE_PATH} HTTP/1.0\r\nHost: {TRACE_HOST}\r\n\r\n").as_bytes())?;
+    let mut response = Vec::new();
+    tls.take(TRACE_MAX).read_to_end(&mut response)?;
+    parse_trace(&String::from_utf8_lossy(&response))
+}
+
+fn parse_trace(response: &str) -> io::Result<String> {
+    let bad = |what: &str| io::Error::other(format!("{what} в ответе {TRACE_HOST}: «{}»", response.trim()));
+    let (head, body) = response.split_once("\r\n\r\n").ok_or_else(|| bad("нет заголовков"))?;
+    let status = head.lines().next().unwrap_or_default();
+    if status.split_whitespace().nth(1) != Some("200") {
+        return Err(bad("не 200"));
+    }
+    let field = |key: &str| body.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('='));
+    let ip = field("ip").ok_or_else(|| bad("нет ip="))?;
+    Ok(match field("loc") {
+        Some(loc) => format!("{ip} ({loc})"),
+        None => ip.into(),
+    })
+}
+
 /// Гоняет байты в обе стороны до закрытия. Обрыв соединения (reset) — обычный конец сессии.
 fn relay(client: TcpStream, up: TcpStream) -> io::Result<()> {
     let (mut client_rx, mut up_tx) = (client.try_clone()?, up.try_clone()?);
@@ -412,6 +446,17 @@ mod tests {
             assert!(!e.contains("secret"), "{e}");
         }
         assert!(Upstream::parse("socks5://u:%zz@h:1").is_err());
+    }
+
+    #[test]
+    fn trace_gives_ip_and_country() {
+        let ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nfl=1\nh=1.1.1.1\nip=203.0.113.7\nts=1\nloc=NL\n";
+        assert_eq!(parse_trace(ok).unwrap(), "203.0.113.7 (NL)");
+        let no_loc = "HTTP/1.1 200 OK\r\n\r\nip=2001:db8::1\n";
+        assert_eq!(parse_trace(no_loc).unwrap(), "2001:db8::1");
+        let e = parse_trace("HTTP/1.1 403 Forbidden\r\n\r\nблок").unwrap_err().to_string();
+        assert!(e.contains("403") && e.contains("блок"), "{e}");
+        assert!(parse_trace("HTTP/1.1 200 OK\r\n\r\nvisit_scheme=https\n").is_err());
     }
 
     #[test]
