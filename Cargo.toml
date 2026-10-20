@@ -1,6 +1,6 @@
 [package]
 name = "little-proxy"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Заворачивает TCP-трафик выбранных процессов Windows в SOCKS5/HTTP-прокси"
 license = "MIT"
