@@ -15,8 +15,19 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             proxy: "socks5://127.0.0.1:1080".into(),
-            rules: vec![r"\\claude[^\\]*\.exe$".into()],
-            domains: ["claude.ai", "claude.com", "anthropic.com", "claudeusercontent.com"].map(String::from).into(),
+            rules: vec![r"\\claude[^\\]*\.exe$".into(), r"\\telegram\.exe$".into()],
+            domains: [
+                "claude.ai",
+                "claude.com",
+                "anthropic.com",
+                "claudeusercontent.com",
+                "telegram.org",
+                "t.me",
+                "telegram.me",
+                "telesco.pe",
+            ]
+            .map(String::from)
+            .into(),
         }
     }
 }
