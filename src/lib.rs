@@ -7,3 +7,4 @@ pub mod engine;
 pub mod log;
 pub mod procs;
 pub mod proxy;
+mod service;

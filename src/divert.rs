@@ -11,6 +11,13 @@ use windows_sys::Win32::{
 static DLL: &[u8] = include_bytes!("../vendor/windivert/WinDivert.dll");
 static SYS: &[u8] = include_bytes!("../vendor/windivert/WinDivert64.sys");
 
+/// Имя службы, под которой WinDivert 2.x регистрирует свой драйвер.
+pub const SERVICE: &str = "WinDivert";
+/// Приоритет наших хэндлов. Другие программы на WinDivert (zapret, GoodbyeDPI) обычно открывают
+/// свои с приоритетом 0; при равных приоритетах порядок не определён, и пакеты, которые мы
+/// возвращаем в сеть, могут не дойти до их хэндлов (или наоборот). С более высоким приоритетом
+/// пакет сначала проходит через нас, а пропущенный без изменений — дальше к ним.
+const PRIORITY: i16 = 1000;
 pub const LAYER_NETWORK: u32 = 0;
 pub const LAYER_SOCKET: u32 = 3;
 pub const FLAG_SNIFF: u64 = 0x1;
@@ -169,7 +176,7 @@ impl Handle {
     pub fn open(filter: &str, layer: u32, flags: u64) -> io::Result<Handle> {
         let filter = format!("{filter}\0");
         // SAFETY: фильтр — строка с завершающим нулём.
-        let h = unsafe { (api().open)(filter.as_ptr(), layer, 0, flags) };
+        let h = unsafe { (api().open)(filter.as_ptr(), layer, PRIORITY, flags) };
         if h == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }

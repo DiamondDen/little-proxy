@@ -9,13 +9,26 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM},
-    Graphics::Gdi::{CreateFontIndirectW, GetSysColorBrush, COLOR_BTNFACE, HFONT},
-    System::LibraryLoader::GetModuleHandleW,
+    Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::Gdi::{
+        CreateFontIndirectW, DrawFocusRect, DrawTextW, FillRect, GetDC, GetSysColor, GetSysColorBrush, ReleaseDC,
+        SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
+        COLOR_WINDOWTEXT, DRAW_TEXT_FORMAT, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK, HFONT, HGDIOBJ,
+        TRANSPARENT,
+    },
+    System::{
+        DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+        LibraryLoader::GetModuleHandleW,
+        Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE},
+        Ole::CF_UNICODETEXT,
+    },
     UI::{
-        Controls::{InitCommonControlsEx, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, NMHDR, NM_CLICK, NM_RETURN},
+        Controls::{
+            InitCommonControlsEx, DRAWITEMSTRUCT, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, MEASUREITEMSTRUCT, NMHDR, NM_CLICK,
+            NM_RETURN, ODS_FOCUS, ODS_SELECTED,
+        },
         HiDpi::*,
-        Input::KeyboardAndMouse::EnableWindow,
+        Input::KeyboardAndMouse::{EnableWindow, GetKeyState, VK_CONTROL},
         Shell::{
             ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
             NOTIFYICONDATAW,
@@ -35,6 +48,11 @@ use little_proxy::{
 const ID_START: i32 = 100;
 const ID_CHECK: i32 = 101;
 const ID_GITHUB: i32 = 102;
+const ID_LOG: i32 = 103;
+/// Отступ текста строки журнала от краёв, пикселей при 96 dpi.
+const LOG_PAD: i32 = 2;
+/// Больше строка списка с переменной высотой быть не может.
+const LOG_ITEM_MAX: u32 = 255;
 const GITHUB_URL: &str = "https://github.com/DiamondDen/little-proxy";
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 300;
@@ -47,6 +65,13 @@ const WM_SHOW_EXISTING: u32 = WM_APP + 2;
 const MENU_SHOW: usize = 1;
 const MENU_TOGGLE: usize = 2;
 const MENU_EXIT: usize = 3;
+const MENU_COPY: usize = 4;
+const MENU_COPY_ALL: usize = 5;
+const MENU_SELECT_ALL: usize = 6;
+/// Ответ на WM_VKEYTOITEM: клавиша обработана, список её не получит.
+const VKEY_HANDLED: LRESULT = -2;
+/// Ответ на WM_VKEYTOITEM: пусть список обработает клавишу сам.
+const VKEY_DEFAULT: LRESULT = -1;
 
 struct App {
     hwnd: HWND,
@@ -78,6 +103,8 @@ thread_local! {
     static APP: RefCell<Option<App>> = const { RefCell::new(None) };
     /// Сообщение, которое Проводник рассылает после перезапуска: значок трея нужно вернуть.
     static TASKBAR_CREATED: Cell<u32> = const { Cell::new(0) };
+    /// Текст строки, которую сейчас добавляют в журнал (для WM_MEASUREITEM).
+    static LOG_ADDING: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -107,6 +134,99 @@ fn lines(h: HWND) -> Vec<String> {
 fn send(h: HWND, msg: u32, w: usize, l: isize) -> isize {
     // SAFETY: сообщения стандартных контролов с корректными аргументами.
     unsafe { SendMessageW(h, msg, w, l) }
+}
+
+/// Кладёт текст в буфер обмена.
+fn set_clipboard(hwnd: HWND, text: &str) -> io::Result<()> {
+    let text = wide(text);
+    // SAFETY: память выделена на всю строку с нулём; после успешного SetClipboardData она
+    // принадлежит системе, иначе освобождаем сами. Буфер закрывается на всех путях.
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let put = || {
+            if EmptyClipboard() == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mem = GlobalAlloc(GMEM_MOVEABLE, text.len() * 2);
+            if mem.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let dst = GlobalLock(mem) as *mut u16;
+            if dst.is_null() {
+                let e = io::Error::last_os_error();
+                GlobalFree(mem);
+                return Err(e);
+            }
+            std::ptr::copy_nonoverlapping(text.as_ptr(), dst, text.len());
+            GlobalUnlock(mem);
+            if SetClipboardData(CF_UNICODETEXT as u32, mem as HANDLE).is_null() {
+                let e = io::Error::last_os_error();
+                GlobalFree(mem);
+                return Err(e);
+            }
+            Ok(())
+        };
+        let result = put();
+        CloseClipboard();
+        result
+    }
+}
+
+const LOG_TEXT_FLAGS: DRAW_TEXT_FORMAT = DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX;
+
+/// Прямоугольник текста строки журнала шириной `width`; отступы масштабируются с dpi.
+fn log_text_rect(left: i32, top: i32, width: i32) -> RECT {
+    // SAFETY: без аргументов.
+    let pad = LOG_PAD * unsafe { GetDpiForSystem() } as i32 / 96;
+    RECT { left: left + pad, top: top + pad / 2, right: left + width - pad, bottom: top + pad / 2 }
+}
+
+/// Добавляет строку в журнал. Высоту строки список спрашивает (WM_MEASUREITEM) посреди
+/// LB_ADDSTRING, а надёжно передать туда текст можно только так — через `LOG_ADDING`.
+fn add_log_line(list: HWND, line: &str) {
+    LOG_ADDING.with(|t| *t.borrow_mut() = line.encode_utf16().collect());
+    send(list, LB_ADDSTRING, 0, wide(line).as_ptr() as isize);
+}
+
+/// Высота добавляемой строки журнала с переносом по ширине списка.
+unsafe fn measure_log_item(hwnd: HWND, mi: &mut MEASUREITEMSTRUCT) {
+    let list = GetDlgItem(hwnd, ID_LOG);
+    let mut client = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    GetClientRect(list, &mut client);
+    let text = LOG_ADDING.with(|t| t.borrow().clone());
+    let dc = GetDC(list);
+    let old = SelectObject(dc, SendMessageW(list, WM_GETFONT, 0, 0) as HGDIOBJ);
+    let mut rect = log_text_rect(0, 0, client.right);
+    let line = DrawTextW(dc, text.as_ptr(), text.len() as i32, &mut rect, LOG_TEXT_FLAGS | DT_CALCRECT);
+    SelectObject(dc, old);
+    ReleaseDC(list, dc);
+    let pad = rect.top * 2;
+    mi.itemHeight = ((line.max(1) + pad) as u32).min(LOG_ITEM_MAX);
+}
+
+/// Рисует строку журнала с переносом; выделенные — системными цветами выделения.
+unsafe fn draw_log_item(di: &DRAWITEMSTRUCT) {
+    if di.itemID == u32::MAX {
+        return; // пустой список: рисовать нечего
+    }
+    let list = di.hwndItem;
+    let len = SendMessageW(list, LB_GETTEXTLEN, di.itemID as usize, 0).max(0) as usize;
+    let mut buf = vec![0u16; len + 1];
+    let n = SendMessageW(list, LB_GETTEXT, di.itemID as usize, buf.as_mut_ptr() as isize).max(0) as usize;
+    let selected = di.itemState & ODS_SELECTED != 0;
+    let (bg, fg) = if selected { (COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT) } else { (COLOR_WINDOW, COLOR_WINDOWTEXT) };
+    FillRect(di.hDC, &di.rcItem, GetSysColorBrush(bg));
+    SetTextColor(di.hDC, GetSysColor(fg));
+    SetBkMode(di.hDC, TRANSPARENT as i32);
+    let r = &di.rcItem;
+    let mut rect = log_text_rect(r.left, r.top, r.right - r.left);
+    rect.bottom = r.bottom;
+    DrawTextW(di.hDC, buf.as_ptr(), n.min(len) as i32, &mut rect, LOG_TEXT_FLAGS);
+    if di.itemState & ODS_FOCUS != 0 {
+        DrawFocusRect(di.hDC, &di.rcItem);
+    }
 }
 
 /// Значок в трее: добавить, обновить подсказку или убрать. `false` — оболочка отказала.
@@ -313,16 +433,118 @@ impl App {
         set_text(self.start, if running { "Остановить" } else { "Запустить" });
     }
 
-    /// Видна ли последняя строка журнала.
-    fn log_at_bottom(&self) -> bool {
+    /// Номера выделенных строк журнала.
+    fn log_selection(&self) -> Vec<usize> {
+        let count = send(self.log_box, LB_GETSELCOUNT, 0, 0).max(0) as usize;
+        let mut items = vec![0i32; count];
+        let got = send(self.log_box, LB_GETSELITEMS, count, items.as_mut_ptr() as isize).max(0) as usize;
+        items.truncate(got);
+        items.into_iter().map(|i| i as usize).collect()
+    }
+
+    fn log_line(&self, i: usize) -> String {
+        let len = send(self.log_box, LB_GETTEXTLEN, i, 0).max(0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let n = send(self.log_box, LB_GETTEXT, i, buf.as_mut_ptr() as isize).max(0) as usize;
+        String::from_utf16_lossy(&buf[..n.min(len)])
+    }
+
+    /// Копирует выделенные строки журнала (`all` — весь журнал) в буфер обмена.
+    fn copy_log(&self, all: bool) {
+        let items = if all {
+            (0..send(self.log_box, LB_GETCOUNT, 0, 0).max(0) as usize).collect()
+        } else {
+            self.log_selection()
+        };
+        if items.is_empty() {
+            return;
+        }
+        let text: Vec<String> = items.into_iter().map(|i| self.log_line(i)).collect();
+        if let Err(e) = set_clipboard(self.hwnd, &text.join("\r\n")) {
+            self.log.push(format!("Не удалось скопировать журнал: {e}"));
+        }
+    }
+
+    fn select_all_log(&self) {
         let count = send(self.log_box, LB_GETCOUNT, 0, 0);
-        let top = send(self.log_box, LB_GETTOPINDEX, 0, 0);
-        let item = send(self.log_box, LB_GETITEMHEIGHT, 0, 0).max(1);
+        if count > 0 {
+            send(self.log_box, LB_SELITEMRANGEEX, 0, count - 1);
+        }
+    }
+
+    /// Ctrl+C и Ctrl+A в журнале; остальные клавиши — списку.
+    fn log_key(&self, vkey: u32) -> LRESULT {
+        // SAFETY: читаем состояние клавиатуры текущего потока.
+        let ctrl = unsafe { GetKeyState(VK_CONTROL as i32) } < 0;
+        match (ctrl, char::from_u32(vkey)) {
+            (true, Some('C')) => self.copy_log(false),
+            (true, Some('A')) => self.select_all_log(),
+            _ => return VKEY_DEFAULT,
+        }
+        VKEY_HANDLED
+    }
+
+    /// Меню журнала по правому клику или клавише меню (`l == -1`).
+    fn log_menu(&self, l: LPARAM) {
+        // SAFETY: меню создаётся и уничтожается здесь же.
+        let cmd = unsafe {
+            let menu = CreatePopupMenu();
+            let copy_flags = if self.log_selection().is_empty() { MF_STRING | MF_GRAYED } else { MF_STRING };
+            AppendMenuW(menu, copy_flags, MENU_COPY, wide("Копировать\tCtrl+C").as_ptr());
+            AppendMenuW(menu, MF_STRING, MENU_COPY_ALL, wide("Копировать всё").as_ptr());
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+            AppendMenuW(menu, MF_STRING, MENU_SELECT_ALL, wide("Выделить всё\tCtrl+A").as_ptr());
+            let (mut x, mut y) = ((l & 0xFFFF) as i16 as i32, ((l >> 16) & 0xFFFF) as i16 as i32);
+            if l == -1 {
+                let mut pt = std::mem::zeroed();
+                GetCursorPos(&mut pt);
+                (x, y) = (pt.x, pt.y);
+            }
+            let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, x, y, 0, self.hwnd, null());
+            DestroyMenu(menu);
+            cmd as usize
+        };
+        match cmd {
+            MENU_COPY => self.copy_log(false),
+            MENU_COPY_ALL => self.copy_log(true),
+            MENU_SELECT_ALL => self.select_all_log(),
+            _ => {}
+        }
+    }
+
+    fn log_height(&self) -> i32 {
         let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
         // SAFETY: хэндл журнала жив вместе с окном.
         unsafe { GetClientRect(self.log_box, &mut rect) };
-        let visible = (rect.bottom - rect.top) as isize / item;
-        top + visible >= count
+        rect.bottom - rect.top
+    }
+
+    /// Видна ли последняя строка журнала целиком (строки разной высоты — из-за переноса).
+    fn log_at_bottom(&self) -> bool {
+        let count = send(self.log_box, LB_GETCOUNT, 0, 0);
+        if count <= 0 {
+            return true;
+        }
+        let mut item = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        send(self.log_box, LB_GETITEMRECT, (count - 1) as usize, &mut item as *mut RECT as isize);
+        item.bottom <= self.log_height()
+    }
+
+    /// Прокручивает так, чтобы последние строки заполнили журнал до низа.
+    fn scroll_log_to_end(&self) {
+        let count = send(self.log_box, LB_GETCOUNT, 0, 0).max(0) as usize;
+        let height = self.log_height() as isize;
+        let (mut top, mut used) = (count, 0);
+        while top > 0 {
+            let h = send(self.log_box, LB_GETITEMHEIGHT, top - 1, 0);
+            if used + h > height {
+                break;
+            }
+            used += h;
+            top -= 1;
+        }
+        // Последняя строка выше окна журнала — показываем хотя бы её начало.
+        send(self.log_box, LB_SETTOPINDEX, top.min(count.saturating_sub(1)), 0);
     }
 
     fn tick(&mut self) {
@@ -332,14 +554,14 @@ impl App {
             // Докручиваем вниз, только если пользователь и так внизу — иначе не мешаем читать.
             let follow = self.log_at_bottom();
             for line in lines {
-                send(self.log_box, LB_ADDSTRING, 0, wide(&line).as_ptr() as isize);
+                add_log_line(self.log_box, &line);
             }
             let count = send(self.log_box, LB_GETCOUNT, 0, 0).max(0) as usize;
             for _ in LOG_LINES..count {
                 send(self.log_box, LB_DELETESTRING, 0, 0);
             }
             if follow {
-                send(self.log_box, LB_SETTOPINDEX, count.min(LOG_LINES).saturating_sub(1), 0);
+                self.scroll_log_to_end();
             }
         }
         let status = match &self.engine {
@@ -357,22 +579,37 @@ impl App {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     // Контролы шлют родителю уведомления посреди наших же SendMessage — тогда состояние уже
     // занято, и сообщение уходит в обработку по умолчанию.
+    // Журнал рисуем сами (перенос строк). Эти сообщения приходят посреди LB_ADDSTRING, когда
+    // состояние окна занято, — поэтому обходимся без него.
+    match msg {
+        WM_MEASUREITEM if (*(l as *const MEASUREITEMSTRUCT)).CtlID == ID_LOG as u32 => {
+            measure_log_item(hwnd, &mut *(l as *mut MEASUREITEMSTRUCT));
+            return 1;
+        }
+        WM_DRAWITEM if (*(l as *const DRAWITEMSTRUCT)).CtlID == ID_LOG as u32 => {
+            draw_log_item(&*(l as *const DRAWITEMSTRUCT));
+            return 1;
+        }
+        _ => {}
+    }
     let handled = APP.with(|app| {
-        let Ok(mut app) = app.try_borrow_mut() else { return false };
-        let Some(app) = app.as_mut() else { return false };
+        let mut app = app.try_borrow_mut().ok()?;
+        let app = app.as_mut()?;
         match msg {
             WM_COMMAND if (w >> 16) as u32 == BN_CLICKED => match (w & 0xFFFF) as i32 {
                 ID_START => app.toggle(),
                 ID_CHECK => app.check(),
-                _ => return false,
+                _ => return None,
             },
             WM_NOTIFY => {
                 let hdr = &*(l as *const NMHDR);
                 if hdr.idFrom != ID_GITHUB as usize || !matches!(hdr.code, NM_CLICK | NM_RETURN) {
-                    return false;
+                    return None;
                 }
                 app.open_github();
             }
+            WM_VKEYTOITEM if l as HWND == app.log_box => return Some(app.log_key((w & 0xFFFF) as u32)),
+            WM_CONTEXTMENU if w as HWND == app.log_box => app.log_menu(l),
             WM_TIMER => app.tick(),
             // Свёрнутое окно прячем в трей. Крестик при работающем перехвате тоже прячет (выход —
             // из меню значка), а при остановленном — закрывает программу.
@@ -399,11 +636,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 tray(hwnd, app.icon, NIM_DELETE, "");
                 PostQuitMessage(0);
             }
-            _ => return false,
+            _ => return None,
         }
-        true
+        Some(0)
     });
-    if handled { 0 } else { DefWindowProcW(hwnd, msg, w, l) }
+    handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, w, l))
 }
 
 fn main() {
@@ -494,9 +731,10 @@ fn main() {
         let start = ctl("BUTTON", "Запустить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 12, 264, 120, 28, ID_START);
         ctl("BUTTON", "Проверить", BS_PUSHBUTTON | WS_TABSTOP as i32, 0, 140, 264, 110, 28, ID_CHECK);
         let status = label("", 260, 268, 208);
-        let log_box =
-            ctl("LISTBOX", "", LBS_NOINTEGRALHEIGHT | LBS_NOSEL | WS_VSCROLL as i32 | WS_HSCROLL as i32, WS_EX_CLIENTEDGE, 12, 302, 456, 204, 0);
-        SendMessageW(log_box, LB_SETHORIZONTALEXTENT, s(1200) as usize, 0);
+        // Своя отрисовка строк — ради переноса. Полоса прокрутки видна всегда: ширина текста,
+        // по которой считается перенос, не должна меняться с её появлением.
+        let log_style = LBS_NOINTEGRALHEIGHT | LBS_EXTENDEDSEL | LBS_WANTKEYBOARDINPUT | LBS_OWNERDRAWVARIABLE | LBS_HASSTRINGS | LBS_DISABLENOSCROLL;
+        let log_box = ctl("LISTBOX", "", log_style | WS_TABSTOP as i32 | WS_VSCROLL as i32, WS_EX_CLIENTEDGE, 12, 302, 456, 204, ID_LOG);
         let link = format!("<a>{}</a>", GITHUB_URL.trim_start_matches("https://"));
         ctl("SysLink", &link, WS_TABSTOP as i32, 0, 12, 514, 456, 20, ID_GITHUB);
 

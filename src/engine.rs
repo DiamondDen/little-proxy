@@ -33,6 +33,7 @@ use crate::{
     log::Log,
     procs::{self, Matcher, TCP, UDP},
     proxy::{self, Upstream},
+    service,
 };
 
 /// Сколько держим запись NAT после конца сессии: хвостовые FIN/ACK ещё нужно перевести.
@@ -100,6 +101,9 @@ pub struct Shared {
     next_id: AtomicU64,
     sessions: Mutex<HashMap<u64, TcpStream>>,
     own_pid: u32,
+    /// Служба DNS Windows: её DoH/DoT не блокируем — при шифровании без перехода на обычный DNS
+    /// у системы перестали бы разрешаться все имена. `None` — доменных правил нет или PID не узнан.
+    dns_service_pid: Option<u32>,
     /// Пусто — доменные правила выключены вместе с блокировкой DoH/DoT.
     domains: Domains,
     doh_hosts: Domains,
@@ -129,6 +133,7 @@ enum Verdict {
 struct Noted {
     udp: HashSet<Arc<str>>,
     secure_dns: HashSet<(IpAddr, u16)>,
+    system_dns: bool,
     quic: bool,
 }
 
@@ -216,9 +221,27 @@ impl Shared {
         }
         let (dst, dst_port) = (ip.dst(p), ip.port(p, 2));
         if self.is_secure_dns(dst, dst_port) {
+            let to = SocketAddr::new(dst, dst_port);
+            let owner = self.owner_pid(ip.proto, ip.port(p, 0));
+            if self.dns_service_pid.is_some() && owner == self.dns_service_pid {
+                if !noted.system_dns {
+                    noted.system_dns = true;
+                    self.log.push(format!(
+                        "Внимание: DNS Windows зашифрован (запросы к {to}). Его не блокируем, иначе при режиме \
+                         «только зашифрованный» перестанут открываться сайты, но адреса доменов из списка так \
+                         не узнать — доменные правила не сработают. Выключите шифрование DNS в параметрах \
+                         сетевого адаптера Windows и перезапустите перехват"
+                    ));
+                }
+                return Verdict::Pass;
+            }
             if noted.secure_dns.insert((dst, dst_port)) {
-                let to = SocketAddr::new(dst, dst_port);
-                self.log.push(format!("DoH/DoT к {to} заблокирован — система и браузеры перейдут на обычный DNS"));
+                let who = owner.and_then(procs::exe_name).map_or_else(|| "неизвестный процесс".into(), |n| n.to_string());
+                self.log.push(format!(
+                    "DoH/DoT к {to} ({who}) заблокирован — программа должна перейти на обычный DNS. Если сайты \
+                     перестали открываться (ERR_NAME_NOT_RESOLVED), в её настройках включён безопасный DNS \
+                     с выбранным провайдером: поставьте «автоматически» или выключите его"
+                ));
             }
             return Verdict::Drop;
         }
@@ -247,6 +270,12 @@ impl Shared {
         !self.domains.is_empty()
             && (port == DOT_PORT
                 || (port == HTTPS_PORT && (dns::DOH_IPS.contains(&dst) || self.learned(dst) == Some(Via::Doh))))
+    }
+
+    /// PID владельца локального порта: из кеша событий сокетов, при промахе — из таблиц IP Helper.
+    fn owner_pid(&self, proto: u8, port: u16) -> Option<u32> {
+        let cached = self.owners.read().unwrap().get(&(proto, port)).map(|o| o.pid);
+        cached.or_else(|| procs::owner_of(proto, port).map(|(pid, _)| pid))
     }
 
     fn learned(&self, ip: IpAddr) -> Option<Via> {
@@ -438,11 +467,24 @@ impl Engine {
         let Setup { upstream, matcher, domains } = setup;
         let doh_hosts = Domains::new(dns::DOH_HOSTS)?;
         divert::load().map_err(|e| format!("WinDivert: {e}"))?;
+        enable_driver(&log);
         // Правило — до открытия порта: иначе Windows успевает показать окно «Разрешить доступ»,
         // а отмена в нём создаёт блокирующие правила, которые сильнее нашего разрешающего.
         allow_in_firewall(&log);
         let (v4, v6) = proxy::listen().map_err(|e| format!("локальный приёмник: {e}"))?;
         let proxy_port = v4.local_addr().map_err(|e| format!("локальный приёмник: {e}"))?.port();
+        let dns_service_pid = if domains.is_empty() {
+            None
+        } else {
+            service::pid("Dnscache")
+                .inspect_err(|e| {
+                    log.push(format!(
+                        "Служба DNS Windows не найдена ({e}): её DoH/DoT тоже блокируется — если в Windows \
+                         включён только зашифрованный DNS, сайты перестанут открываться"
+                    ))
+                })
+                .ok()
+        };
 
         let shared = Arc::new(Shared {
             log,
@@ -455,6 +497,7 @@ impl Engine {
             next_id: AtomicU64::new(1),
             sessions: Mutex::default(),
             own_pid: std::process::id(),
+            dns_service_pid,
             domains,
             doh_hosts,
             learned: RwLock::default(),
@@ -560,12 +603,33 @@ impl Engine {
     }
 }
 
+const STUCK_DRIVER_FIX: &str = "закройте другие программы на WinDivert (zapret, GoodbyeDPI и т.п.), \
+     окно «Службы» и диспетчер задач, либо перезагрузите компьютер";
+
+/// Службу драйвера отключают некоторые программы обхода блокировок и антивирусы — тогда
+/// WinDivertOpen падает с ERROR_SERVICE_DISABLED (1058). Включаем её запуском вручную.
+fn enable_driver(log: &Log) {
+    match service::enable(divert::SERVICE) {
+        Ok(true) => log.push("Служба драйвера WinDivert была отключена (другой программой или антивирусом) — включена"),
+        Ok(false) => {}
+        // Драйвер ещё ни разу не загружался: службу создаст WinDivertOpen.
+        Err(e) if e.raw_os_error() == Some(service::ERROR_SERVICE_DOES_NOT_EXIST) => {}
+        Err(e) if e.raw_os_error() == Some(service::ERROR_SERVICE_MARKED_FOR_DELETE) => log.push(format!(
+            "Служба драйвера WinDivert ждёт удаления и не запустится, пока её держит открытой другой \
+             процесс: {STUCK_DRIVER_FIX}"
+        )),
+        Err(e) => log.push(format!("Не удалось проверить службу драйвера WinDivert: {e}")),
+    }
+}
+
 fn open_error(e: std::io::Error) -> String {
     let hint = match e.raw_os_error() {
-        Some(5) => " — нужны права администратора",
-        Some(577) | Some(1275) => " — система не загрузила драйвер WinDivert (подпись/блокировка антивирусом)",
-        Some(2) => " — не найден WinDivert64.sys рядом с программой",
-        _ => "",
+        Some(5) => " — нужны права администратора".into(),
+        // Отключённую службу включает enable_driver; если не вышло — служба ждёт удаления.
+        Some(1058) => format!(" — служба драйвера WinDivert отключена или ждёт удаления: {STUCK_DRIVER_FIX}"),
+        Some(577) | Some(1275) => " — система не загрузила драйвер WinDivert (подпись/блокировка антивирусом)".into(),
+        Some(2) => " — не найден WinDivert64.sys рядом с программой".into(),
+        _ => String::new(),
     };
     format!("WinDivert: {e}{hint}")
 }
