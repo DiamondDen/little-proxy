@@ -1,4 +1,4 @@
-# little-proxy
+# <img src="assets/logo.svg" width="40" align="top" alt=""> little-proxy
 
 [![CI](https://github.com/DiamondDen/little-proxy/actions/workflows/ci.yml/badge.svg)](https://github.com/DiamondDen/little-proxy/actions/workflows/ci.yml)
 

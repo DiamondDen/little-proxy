@@ -9,7 +9,7 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{GlobalFree, HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Foundation::{GlobalFree, HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Gdi::{
         CreateFontIndirectW, DrawFocusRect, DrawTextW, FillRect, GetDC, GetSysColor, GetSysColorBrush, ReleaseDC,
         SelectObject, SetBkMode, SetTextColor, COLOR_BTNFACE, COLOR_HIGHLIGHT, COLOR_HIGHLIGHTTEXT, COLOR_WINDOW,
@@ -24,7 +24,7 @@ use windows_sys::Win32::{
     },
     UI::{
         Controls::{
-            InitCommonControlsEx, DRAWITEMSTRUCT, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, MEASUREITEMSTRUCT, NMHDR, NM_CLICK,
+            InitCommonControlsEx, LoadIconMetric, DRAWITEMSTRUCT, LIM_LARGE, LIM_SMALL, _LI_METRIC, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, MEASUREITEMSTRUCT, NMHDR, NM_CLICK,
             NM_RETURN, ODS_FOCUS, ODS_SELECTED,
         },
         HiDpi::*,
@@ -73,9 +73,15 @@ const VKEY_HANDLED: LRESULT = -2;
 /// Ответ на WM_VKEYTOITEM: пусть список обработает клавишу сам.
 const VKEY_DEFAULT: LRESULT = -1;
 
+/// Группы значков в ресурсах exe (их вшивает build.rs).
+const ICON_ON: u16 = 1;
+const ICON_OFF: u16 = 2;
+
 struct App {
     hwnd: HWND,
-    icon: HICON,
+    /// Значки трея: перехват работает / остановлен.
+    icon_on: HICON,
+    icon_off: HICON,
     /// Значок в трее есть: только тогда окно можно прятать.
     tray_ok: bool,
     /// Подсказка «программа в трее» уже показана.
@@ -229,6 +235,18 @@ unsafe fn draw_log_item(di: &DRAWITEMSTRUCT) {
     }
 }
 
+/// Значок из ресурсов exe в системном размере; не загрузился — стандартный значок приложения.
+fn load_icon(instance: HINSTANCE, id: u16, size: _LI_METRIC) -> HICON {
+    let mut icon = std::ptr::null_mut();
+    // SAFETY: имя — номер ресурса (MAKEINTRESOURCE), значок пишется в icon.
+    let hr = unsafe { LoadIconMetric(instance, id as usize as *const u16, size, &mut icon) };
+    if hr < 0 || icon.is_null() {
+        // SAFETY: стандартный значок системы.
+        icon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    }
+    icon
+}
+
 /// Значок в трее: добавить, обновить подсказку или убрать. `false` — оболочка отказала.
 fn tray(hwnd: HWND, icon: HICON, op: u32, tip: &str) -> bool {
     // SAFETY: структура заполнена целиком, строка подсказки обрезана по размеру поля.
@@ -269,6 +287,10 @@ fn tray_balloon(hwnd: HWND, text: &str) {
 }
 
 impl App {
+    fn tray_icon(&self) -> HICON {
+        if self.engine.is_some() { self.icon_on } else { self.icon_off }
+    }
+
     /// Прячет окно в трей; при первом разе подсказывает, где программа и как её закрыть.
     fn hide_to_tray(&mut self) {
         // SAFETY: окно живо, пока жив App.
@@ -571,7 +593,7 @@ impl App {
         };
         if get_text(self.status) != status {
             set_text(self.status, &status);
-            tray(self.hwnd, self.icon, NIM_MODIFY, &format!("little-proxy — {status}"));
+            tray(self.hwnd, self.tray_icon(), NIM_MODIFY, &format!("little-proxy — {status}"));
         }
     }
 }
@@ -623,7 +645,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             WM_SHOW_EXISTING => app.restore(),
             // Проводник перезапустился — значок нужно добавить заново.
             m if m != 0 && m == TASKBAR_CREATED.get() => {
-                app.tray_ok = tray(hwnd, app.icon, NIM_ADD, &format!("little-proxy — {}", get_text(app.status)));
+                app.tray_ok = tray(hwnd, app.tray_icon(), NIM_ADD, &format!("little-proxy — {}", get_text(app.status)));
                 if !app.tray_ok {
                     app.log.push("Не удалось вернуть значок в трей после перезапуска Проводника");
                 }
@@ -633,7 +655,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     engine.stop();
                 }
                 // Значка может уже не быть (Проводник упал) — удалять тогда нечего.
-                tray(hwnd, app.icon, NIM_DELETE, "");
+                tray(hwnd, app.tray_icon(), NIM_DELETE, "");
                 PostQuitMessage(0);
             }
             _ => return None,
@@ -658,13 +680,13 @@ fn main() {
             PostMessageW(existing, WM_SHOW_EXISTING, 0, 0);
             return;
         }
-        let icon = LoadIconW(std::ptr::null_mut(), IDI_APPLICATION);
+        let (icon_on, icon_off) = (load_icon(instance, ICON_ON, LIM_SMALL), load_icon(instance, ICON_OFF, LIM_SMALL));
         TASKBAR_CREATED.set(RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()));
         let wc = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: instance,
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-            hIcon: icon,
+            hIcon: load_icon(instance, ICON_ON, LIM_LARGE),
             hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
             lpszClassName: class.as_ptr(),
             ..std::mem::zeroed()
@@ -738,8 +760,10 @@ fn main() {
         let link = format!("<a>{}</a>", GITHUB_URL.trim_start_matches("https://"));
         ctl("SysLink", &link, WS_TABSTOP as i32, 0, 12, 514, 456, 20, ID_GITHUB);
 
-        let tray_ok = tray(hwnd, icon, NIM_ADD, "little-proxy — Остановлено");
-        let app = App { hwnd, icon, tray_ok, tray_hinted: false, proxy, rules, domains, start, status, log_box, log: Log::default(), engine: None, pending: None };
+        // Мелкий значок окна (заголовок, панель задач) — своего размера, а не сжатый крупный.
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon_on as isize);
+        let tray_ok = tray(hwnd, icon_off, NIM_ADD, "little-proxy — Остановлено");
+        let app = App { hwnd, icon_on, icon_off, tray_ok, tray_hinted: false, proxy, rules, domains, start, status, log_box, log: Log::default(), engine: None, pending: None };
         match Config::load() {
             Ok(cfg) => app.show_config(&cfg.unwrap_or_default()),
             Err(e) => {
